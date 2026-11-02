@@ -1,0 +1,68 @@
+{
+  "id": "dev.kagan.auto-name",
+  "name": "Auto Name",
+  "version": "0.2.1",
+  "kagan": ">=0.1.0",
+  "entry": "main.js",
+  "instructions": "Renames sidebar threads to short recallable word sets from changed paths, events, branch, and project. Deterministic, no model. Names you set yourself are left alone while Respect is on. Use Update thread names now to rescan.",
+  "powers": {
+    "areas": ["threads", "database"]
+  },
+  "settings": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Rename threads automatically",
+      "default": true
+    },
+    "respectManual": {
+      "type": "boolean",
+      "title": "Do not change names I set myself",
+      "default": true
+    },
+    "intervalSec": {
+      "type": "select",
+      "title": "Wait at least this many seconds between name changes",
+      "options": ["15", "30", "45", "60", "120"],
+      "default": "45"
+    },
+    "maxWords": {
+      "type": "select",
+      "title": "Max words in a thread name",
+      "options": ["2", "3", "4"],
+      "default": "4"
+    }
+  },
+  "commands": [
+    {
+      "id": "refresh",
+      "title": "Update thread names now",
+      "when": "always"
+    },
+    {
+      "id": "where-enabled",
+      "title": "Show where to turn renaming on or off",
+      "when": "always"
+    }
+  ],
+  "ui": {
+    "panels": [
+      {
+        "id": "status",
+        "title": "Auto Name",
+        "view": "StatusPanel",
+        "placement": "left"
+      }
+    ]
+  },
+  "events": [
+    "thread.waiting",
+    "thread.idle",
+    "thread.turn.ended",
+    "thread.file.changed",
+    "thread.started",
+    "thread.answered",
+    "thread.notice"
+  ],
+  "tools": [],
+  "skills": []
+}
