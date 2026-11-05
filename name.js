@@ -2,46 +2,30 @@
 /**
  * Deterministic thread titles. O(tokens) core path — no goal×recent cartesian product.
  */
+import {
+  MAX_CHARS,
+  MAX_WORDS,
+  cleanText,
+  contentRuns,
+  formatTitle,
+  isUsefulLine,
+  isKeptWord,
+  splitCommands,
+  stem,
+  tokens,
+} from "./text.js";
 
-const MAX_WORDS = 4;
-const MAX_CHARS = 36;
-const MIN_WORD = 3;
+/** Candidates past this are only added when they come from a whole run. */
 const MAX_CANDIDATES = 48;
-
-/** @type {Set<string>} */
-const STOP = new Set(
-  `
-  a an the and or but if then else when while for to of in on at by from with
-  into over under after before about as is are was were be been being do does did
-  done doing have has had having will would could should may might must can
-  this that these those it its they them their you your we our i me my
-  not no yes so just also only very more most less least much many any some
-  other another each every all both few such than too own same
-  please thanks thank hey hi hello ok okay sure right well now here there
-  let make get set use run try need want help show find look see check
-  create add update fix change remove delete write read open close start stop
-  install installing installed
-  implement implementing implements using used based like looks seems seem
-  keep keeps keeping
-  code codes line lines error errors
-  output input result results test tests todo something anything everything
-  working work works worked available based overall latest state given moment
-  clearer shorter easier quickly recall words word set sets available
-  periodically refresh refreshes refreshing sidebar those those must
-  efficient clever deterministic techniques technique based
-  agent agents claude codex cursor kimi model models prompt prompts
-  truncated hidden expand review ctrl lines seconds ms json true false null
-  kagan kg gpui personal caution folder folders worktree worktrees
-  environment environments users user home tmp temp var private
-  library application support contents macos
-  `.trim().split(/\s+/),
-);
+/** Below this a phrase is noise, not a name. */
+const MIN_SCORE = 2;
 
 const PLACEHOLDER =
   /^(new thread|new plugin|agent|claude|codex|cursor-agent|kimi|terminal|untitled|thread)$/i;
 
-const NOISE_LINE =
-  /^(?:\s*[❯$›>]\s|\s*…|\s*\.\.\.|Grepped|Read |Edited |Wrote |Running |Thinking|Waiting|Tool |Bash |Shell |function_calls)/i;
+/** Kagan titles a new thread after its program, sometimes with flags. */
+const PROGRAM =
+  /^(claude|codex|cursor-agent|kimi|opencode|gemini|aider|bash|zsh|sh|fish|pwsh|powershell|node|python3?)(\s|$)/i;
 
 const PATH_NOISE =
   /^(src|lib|bin|dist|build|node_modules|crates|tests|personal|agent|users|home|tmp|var|private|library|application|support|contents|macos|kagan|env_[a-f0-9]+|thr_[a-f0-9]+|main|index|mod|test|spec)$/i;
@@ -53,164 +37,67 @@ const VAGUE = new Set(
   ),
 );
 
-/** Keep these hyphen compounds instead of splitting (STOP would eat "in"). */
-const COMPOUND = new Set(["in-app", "end-to-end", "full-stack", "open-source", "real-time"]);
+/** Why a phrase was chosen. `better` is the only reason to rename. */
+/** @typedef {"better" | "no-signal"} ProposalReason */
 
 /**
- * @param {string} text
+ * Everything one proposal is built from, and the context its phrases are scored in.
+ * @typedef {{ goal: Map<string, number>, recent: Map<string, number>,
+ *   paths: Set<string>, contiguous?: boolean, goalText: string, recentText: string,
+ *   goalWords: string[], recentWords: string[], pathWords: string[],
+ *   maxWords: number, commands: string[], quotes: string[] }} Evidence
  */
-export function cleanText(text) {
-  return String(text || "")
-    .replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "")
-    .replace(/\r/g, "\n")
-    .replace(/[^\S\n]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-/**
- * @param {string} text
- */
-export function usefulLines(text) {
-  return cleanText(text)
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length >= 8 && l.length < 240 && !NOISE_LINE.test(l));
-}
-
-/**
- * @param {string} word
- */
-function keepWord(word) {
-  if (word.length < MIN_WORD || word.length > 28) return false;
-  if (STOP.has(word)) return false;
-  if (/^\d+$/.test(word)) return false;
-  if (/^[0-9a-f]{8,}$/i.test(word)) return false;
-  if (/^thr_|^env_|^dev\./i.test(word)) return false;
-  if (/\./.test(word)) return false;
-  return /[a-z]/i.test(word);
-}
-
-/**
- * @param {string} text
- */
-export function tokens(text) {
-  return cleanText(text)
-    .toLowerCase()
-    .replace(/['’]/g, "")
-    .split(/[^a-z0-9.+#-]+/i)
-    .map((w) => w.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, ""))
-    .filter(keepWord);
-}
-
-/** @param {string} w */
-function fold(w) {
-  const base = w.replace(/[-_]+/g, "");
-  if (base.length <= 4) return base;
-  return base.replace(/(ing|tion|ments|ment|ers|ies|ied|ed|es|s)$/i, (m) => {
-    if (m === "ies" || m === "ied") return "y";
-    if (m === "es" || m === "s") return "";
-    return "";
-  });
-}
-
-/**
- * True when two titles are the same idea (hyphen/space/duplicate words).
- * @param {string} a
- * @param {string} b
- */
-export function sameMeaning(a, b) {
-  const na = formatTitle(a);
-  const nb = formatTitle(b);
-  return !!na && na === nb;
-}
-
-/**
- * @param {string} text
- * @returns {string[][]}
- */
-function contentRuns(text) {
-  let lowered = cleanText(text).toLowerCase().replace(/['’]/g, "");
-  for (const c of COMPOUND) {
-    lowered = lowered.split(c).join(c.replace(/-/g, "\u0000"));
-  }
-  const raw = lowered
-    .replace(/[-_]+/g, " ")
-    .replace(/\u0000/g, "-")
-    .split(/[^a-z0-9.+#-]+/i)
-    .map((w) => w.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, ""))
-    .filter((w) => {
-      if (!w || /^\d+$/.test(w)) return false;
-      if (w.includes("-")) return w.length >= MIN_WORD && /[a-z]/i.test(w);
-      return w.length >= MIN_WORD && /[a-z]/i.test(w) && !STOP.has(w);
-    });
-
-  /** @type {string[][]} */
-  const runs = [];
-  /** @type {string[]} */
-  let cur = [];
-  for (const w of raw) {
-    if (STOP.has(w) || /^thr_|^env_|^dev\./i.test(w) || /^[0-9a-f]{8,}$/i.test(w)) {
-      if (cur.length) {
-        runs.push(cur);
-        cur = [];
-      }
-      continue;
-    }
-    cur.push(w);
-  }
-  if (cur.length) runs.push(cur);
-  return runs;
-}
 
 /**
  * @param {string[]} paths
+ * @returns {string[]} words a file name suggests, in reading order
  */
 export function pathHints(paths) {
   /** @type {string[]} */
   const hints = [];
   for (const p of paths || []) {
     const parts = String(p).split(/[/\\]/).filter(Boolean);
-    const base = parts[parts.length - 1] || "";
-    const stem = base.replace(/\.[a-z0-9]+$/i, "");
-    if (keepWord(stem.toLowerCase().replace(/[-_]+/g, "")) || keepWord(stem.split(/[-_]/)[0] || "")) {
-      if (!PATH_NOISE.test(stem)) hints.push(stem.replace(/[-_]+/g, " ").toLowerCase());
-    }
-    for (const part of parts.slice(-3, -1)) {
-      if (!PATH_NOISE.test(part) && keepWord(part.toLowerCase().replace(/[-_]+/g, " ").split(/\s+/)[0] || "")) {
-        hints.push(part.replace(/[-_]+/g, " ").toLowerCase());
-      }
+    const file = (parts[parts.length - 1] || "").replace(/\.[a-z0-9]+$/i, "");
+    for (const name of [file, ...parts.slice(-3, -1)]) {
+      if (!name || PATH_NOISE.test(name)) continue;
+      const words = tokens(name.replace(/[-_]+/g, " ")).slice(0, 2);
+      if (words.length) hints.push(words.join(" "));
     }
   }
   return hints;
 }
 
 /**
- * @param {string[]} lines
+ * @param {string[]} words
  */
-function zones(lines) {
-  if (lines.length === 0) return { goal: [], recent: [] };
-  const goalEnd = Math.max(1, Math.min(14, Math.ceil(lines.length * 0.3)));
-  const recentStart = Math.max(goalEnd, lines.length - Math.max(8, Math.ceil(lines.length * 0.4)));
-  return { goal: lines.slice(0, goalEnd), recent: lines.slice(recentStart) };
+function wordCounts(words) {
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+  for (const w of words) {
+    const k = stem(w);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return counts;
 }
 
 /**
+ * The words that appear most often, spelled as they were written.
  * @param {string[]} words
+ * @param {number} limit
  */
-function bag(words) {
+function topWords(words, limit) {
   /** @type {Map<string, number>} */
-  const m = new Map();
-  for (const w of words) {
-    const k = fold(w);
-    m.set(k, (m.get(k) || 0) + 1);
-  }
-  return m;
+  const counts = new Map();
+  for (const w of words) counts.set(w, (counts.get(w) || 0) + 1);
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([w]) => w);
 }
 
 /**
  * @param {string} phrase
- * @param {{ goal: Map<string, number>, recent: Map<string, number>, paths: Set<string>, contiguous?: boolean }} ctx
+ * @param {Evidence} ctx
  */
 function scorePhrase(phrase, ctx) {
   const words = phrase.split(/\s+/).filter(Boolean);
@@ -223,7 +110,7 @@ function scorePhrase(phrase, ctx) {
   let pathHits = 0;
 
   for (const w of words) {
-    const f = fold(w);
+    const f = stem(w);
     const g = ctx.goal.get(f) || 0;
     const r = ctx.recent.get(f) || 0;
     if (g) {
@@ -239,7 +126,7 @@ function scorePhrase(phrase, ctx) {
   }
 
   const bridge = words.filter((w) => {
-    const f = fold(w);
+    const f = stem(w);
     return (ctx.goal.get(f) || 0) > 0 && (ctx.recent.get(f) || 0) > 0;
   }).length;
   score += bridge * 2;
@@ -260,57 +147,10 @@ function scorePhrase(phrase, ctx) {
 }
 
 /**
- * @param {string} phrase
- */
-export function formatTitle(phrase) {
-  /** @type {string[]} */
-  const out = [];
-  /** @type {Set<string>} */
-  const seen = new Set();
-  // Protect known compounds, then split remaining hyphens.
-  let raw = String(phrase).toLowerCase();
-  for (const c of COMPOUND) {
-    raw = raw.split(c).join(c.replace(/-/g, "\u0000"));
-  }
-  for (const w of raw
-    .replace(/[-_]+/g, " ")
-    .replace(/\u0000/g, "-")
-    .split(/\s+/)
-    .filter(Boolean)) {
-    const token = w.includes("-") ? w : w;
-    if (token.includes("-")) {
-      const f = fold(token.replace(/-/g, ""));
-      if (seen.has(f)) continue;
-      seen.add(f);
-      out.push(token);
-    } else {
-      const f = fold(token);
-      if (seen.has(f)) continue;
-      seen.add(f);
-      out.push(token);
-    }
-    if (out.length >= MAX_WORDS) break;
-  }
-  return out.join(" ").slice(0, MAX_CHARS).trim();
-}
-
-/**
- * @param {string} title
- * @param {string} candidate
- */
-function overlapRatio(title, candidate) {
-  const a = new Set(tokens(title).map(fold));
-  const b = tokens(candidate).map(fold);
-  if (!a.size || !b.length) return 0;
-  const hit = b.filter((w) => a.has(w)).length;
-  return hit / Math.max(a.size, b.length);
-}
-
-/**
  * Add only the head/tail windows of a run — O(maxWords) per run, not O(n²).
  * @param {string[]} run
  * @param {number} maxWords
- * @param {(phrase: string, opts?: object) => void} add
+ * @param {(phrase: string, opts?: { contiguous?: boolean, boost?: number }) => void} add
  * @param {number} boost
  */
 function addRunWindows(run, maxWords, add, boost) {
@@ -322,190 +162,171 @@ function addRunWindows(run, maxWords, add, boost) {
 }
 
 /**
- * @param {{ screen?: string, paths?: string[], currentTitle?: string, maxWords?: number }} input
+ * @param {string} text
+ * @param {number} maxWords
  */
-export function proposeTitle(input) {
-  const screen = cleanText(input.screen || "");
-  const lines = usefulLines(screen);
-  const { goal, recent } = zones(lines);
+function quotedPhrases(text, maxWords) {
+  /** @type {string[]} */
+  const quotes = [];
+  for (const m of text.matchAll(/["“']([^"”']{3,40})["”']/g)) {
+    const q = tokens(m[1]).slice(0, maxWords).join(" ");
+    if (q) quotes.push(q);
+  }
+  return quotes;
+}
+
+/**
+ * What the evidence is made of, before any candidate is scored.
+ * @param {{ goal?: string[], recent?: string[], paths?: string[], maxWords?: number }} input
+ * @returns {Evidence}
+ */
+function readEvidence(input) {
+  // Commands are pulled out before the short-line filter, so "/ship" survives.
+  const { body, commands } = splitCommands((input.goal || []).join("\n"));
+  const goalText = body
+    .split("\n")
+    .map((line) => cleanText(line))
+    .filter(isUsefulLine)
+    .join("\n");
+  const recentText = (input.recent || [])
+    .map((line) => cleanText(line))
+    .filter(isUsefulLine)
+    .join("\n");
+  const goalTok = tokens(goalText);
+  for (const command of commands) goalTok.push(command);
+  const recentTok = tokens(recentText);
   const pathWords = pathHints(input.paths || []);
-  const goalTok = tokens(goal.join("\n"));
-  const recentTok = tokens(recent.join("\n"));
   const maxWords = Math.min(MAX_WORDS, Math.max(1, input.maxWords || MAX_WORDS));
 
-  const goalBag = bag(goalTok);
-  const recentBag = bag(recentTok);
   /** @type {Set<string>} */
   const pathSet = new Set();
   for (const h of pathWords) {
-    for (const w of tokens(h)) pathSet.add(fold(w));
-  }
-
-  /** @type {Map<string, { score: number, contiguous: boolean }>} */
-  const candidates = new Map();
-
-  const add = (phrase, opts = { contiguous: false, boost: 0 }) => {
-    if (candidates.size >= MAX_CANDIDATES && !opts.contiguous) return;
-    const t = formatTitle(phrase);
-    const words = t.split(/\s+/).filter(Boolean);
-    if (!t || words.length < 1 || words.length > maxWords) return;
-    if (words.some((w) => !keepWord(w))) return;
-    const base = scorePhrase(t, {
-      goal: goalBag,
-      recent: recentBag,
-      paths: pathSet,
-      contiguous: opts.contiguous,
-    });
-    const score = base + (opts.boost || 0);
-    const prev = candidates.get(t);
-    if (!prev || score > prev.score) candidates.set(t, { score, contiguous: !!opts.contiguous });
-  };
-
-  for (const run of contentRuns(goal.join("\n"))) addRunWindows(run, maxWords, add, 1);
-  const goalFolds = goalBag;
-  for (const run of contentRuns(recent.join("\n"))) {
-    if (run.some((w) => goalFolds.has(fold(w)))) addRunWindows(run, maxWords, add, 0.5);
-  }
-
-  for (const m of screen.matchAll(/["“']([^"”']{3,40})["”']/g)) {
-    const q = tokens(m[1]).slice(0, maxWords).join(" ");
-    if (q) add(q, { contiguous: true, boost: 1.2 });
-  }
-
-  for (const h of pathWords) {
-    add(h, { contiguous: false, boost: 1.0 });
-    // new-plugin-7 → "new plugin" (drop trailing build numbers)
-    const stripped = h.replace(/\s+\d+$/, "").replace(/-\d+$/, "");
-    if (stripped !== h) add(stripped, { contiguous: true, boost: 1.4 });
-  }
-
-  // Linear bridge: pair top goal unigram with top recent unigram (not full cartesian).
-  const topGoal = [...goalBag.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
-  const topRecent = [...recentBag.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
-  for (const [g] of topGoal) {
-    for (const [r] of topRecent) {
-      if (g !== r) add(`${g} ${r}`, { contiguous: false, boost: 0.3 });
-    }
-  }
-
-  if (input.currentTitle) {
-    const cleaned = formatTitle(tokens(input.currentTitle).slice(0, maxWords).join(" "));
-    if (cleaned) add(cleaned, { contiguous: true, boost: 2 });
-  }
-
-  const ranked = [...candidates.entries()]
-    .map(([title, meta]) => ({ title, score: meta.score, contiguous: meta.contiguous }))
-    .filter((c) => c.score > 2)
-    .sort((a, b) => b.score - a.score || a.title.length - b.title.length);
-
-  const fingerprint = fp(
-    [
-      goalTok.map(fold).slice(0, 24).join(" "),
-      recentTok.map(fold).slice(-24).join(" "),
-      pathWords.map((h) => formatTitle(h)).slice(0, 8).join(" "),
-    ].join("|"),
-  );
-
-  if (ranked.length === 0) {
-    return { title: null, score: 0, reason: "no-signal", fingerprint };
-  }
-
-  // Prefer dropping a vague leading word when a suffix candidate is close in score.
-  let best = ranked[0];
-  {
-    const parts = best.title.split(/\s+/);
-    if (parts.length >= 2 && VAGUE.has(parts[0])) {
-      const suffix = parts.slice(1).join(" ");
-      const alt = ranked.find((c) => c.title === suffix);
-      if (alt && alt.score >= best.score - 4) best = alt;
-      else if (!alt) {
-        const forged = {
-          title: suffix,
-          score: scorePhrase(suffix, {
-            goal: goalBag,
-            recent: recentBag,
-            paths: pathSet,
-            contiguous: true,
-          }),
-          contiguous: true,
-        };
-        if (forged.score > 2 && forged.score >= best.score - 4) best = forged;
-      }
-    }
-  }
-
-  const current = (input.currentTitle || "").trim();
-
-  // Hysteresis: never flip hyphen/space variants of the same meaning.
-  if (current && sameMeaning(current, best.title)) {
-    return { title: null, score: best.score, reason: "same-meaning", fingerprint };
-  }
-
-  const currentClean = formatTitle(tokens(current).slice(0, maxWords).join(" "));
-  const rawWords = current ? current.split(/\s+/).filter(Boolean) : [];
-  const cleanWords = current ? tokens(current) : [];
-  const noisyCurrent =
-    !!current &&
-    rawWords.length >= 3 &&
-    cleanWords.length <= Math.ceil(rawWords.length / 2);
-
-  if (current && !isPlaceholder(current) && !noisyCurrent) {
-    const currentScore = scorePhrase(currentClean || current.toLowerCase(), {
-      goal: goalBag,
-      recent: recentBag,
-      paths: pathSet,
-      contiguous: overlapRatio(current, goal.join(" ")) >= 0.5,
-    });
-
-    if (currentClean && sameMeaning(currentClean, best.title)) {
-      return { title: null, score: best.score, reason: "current-good-enough", fingerprint };
-    }
-
-    if (overlapRatio(currentClean || current, best.title) >= 0.67 && (currentClean || "").length <= best.title.length + 2) {
-      return { title: null, score: best.score, reason: "current-good-enough", fingerprint };
-    }
-
-    // Stronger margin before replacing a stable auto title.
-    const clearer = best.score >= currentScore + 3.5;
-    const shorterEasier =
-      best.score >= currentScore + 1.0 &&
-      best.title.length + 4 < current.length &&
-      best.title.split(" ").length < tokens(current).length;
-
-    if (!clearer && !shorterEasier) {
-      return { title: null, score: best.score, reason: "current-good-enough", fingerprint };
-    }
+    for (const w of tokens(h)) pathSet.add(stem(w));
   }
 
   return {
-    title: best.title,
-    score: best.score,
-    reason: "better",
-    fingerprint,
+    goal: wordCounts(goalTok),
+    recent: wordCounts(recentTok),
+    paths: pathSet,
+    goalText,
+    recentText,
+    goalWords: goalTok,
+    recentWords: recentTok,
+    pathWords,
+    maxWords,
+    commands,
+    quotes: quotedPhrases(`${goalText}\n${recentText}`, maxWords),
   };
 }
 
 /**
+ * Every phrase worth scoring, with its best score.
+ * @param {Evidence} ctx
+ */
+function collectCandidates(ctx) {
+  /** @type {Map<string, { score: number, contiguous: boolean }>} */
+  const candidates = new Map();
+
+  const add = (
+    phrase,
+    /** @type {{ contiguous?: boolean, boost?: number }} */ opts = {},
+  ) => {
+    if (candidates.size >= MAX_CANDIDATES && !opts.contiguous) return;
+    const t = formatTitle(phrase);
+    const words = t.split(/\s+/).filter(Boolean);
+    if (!t || words.length < 1 || words.length > ctx.maxWords) return;
+    if (words.some((w) => !isKeptWord(w))) return;
+    const base = scorePhrase(t, { ...ctx, contiguous: opts.contiguous });
+    const total = base + (opts.boost || 0);
+    const prev = candidates.get(t);
+    if (!prev || total > prev.score) candidates.set(t, { score: total, contiguous: !!opts.contiguous });
+  };
+
+  for (const run of contentRuns(ctx.goalText)) addRunWindows(run, ctx.maxWords, add, 1);
+  // A prompt that is only a command still names its work.
+  for (const command of ctx.commands) addRunWindows([command], ctx.maxWords, add, 0.6);
+  for (const run of contentRuns(ctx.recentText)) {
+    if (run.some((w) => ctx.goal.has(stem(w)))) addRunWindows(run, ctx.maxWords, add, 0.5);
+  }
+
+  for (const quote of ctx.quotes) add(quote, { contiguous: true, boost: 1.2 });
+
+  for (const h of ctx.pathWords) {
+    add(h, { contiguous: false, boost: 1.0 });
+    // new-plugin-7 → "new plugin" (drop trailing build numbers)
+    const stripped = h.replace(/\s+\d+$/, "");
+    if (stripped !== h) add(stripped, { contiguous: true, boost: 1.4 });
+  }
+
+  // Linear bridge: pair a top goal word with a top recent word, not a cartesian product.
+  for (const g of topWords(ctx.goalWords, 4)) {
+    for (const r of topWords(ctx.recentWords, 4)) {
+      if (stem(g) !== stem(r)) add(`${g} ${r}`, { contiguous: false, boost: 0.3 });
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * @param {Map<string, { score: number, contiguous: boolean }>} candidates
+ */
+function rankCandidates(candidates) {
+  return [...candidates.entries()]
+    .map(([title, meta]) => ({ title, score: meta.score }))
+    .filter((c) => c.score > MIN_SCORE)
+    // Equal scores resolve by length, then alphabetically, so a name never flickers.
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.title.length - b.title.length ||
+        (a.title < b.title ? -1 : a.title > b.title ? 1 : 0),
+    );
+}
+
+/**
+ * Prefer dropping a vague leading word when a suffix candidate is close in score.
+ * @param {{ title: string, score: number }} best
+ * @param {{ title: string, score: number }[]} ranked
+ * @param {Evidence} ctx
+ */
+function dropVaguePrefix(best, ranked, ctx) {
+  const parts = best.title.split(/\s+/);
+  if (parts.length < 2 || !VAGUE.has(parts[0])) return best;
+  const suffix = parts.slice(1).join(" ");
+  const alt = ranked.find((c) => c.title === suffix);
+  if (alt) return alt.score >= best.score - 4 ? alt : best;
+  const forged = scorePhrase(suffix, { ...ctx, contiguous: true });
+  return forged > MIN_SCORE && forged >= best.score - 4 ? { title: suffix, score: forged } : best;
+}
+
+/**
+ * @param {{ goal?: string[], recent?: string[], paths?: string[], maxWords?: number }} input
+ * @returns {{ title: string | null, reason: ProposalReason }}
+ */
+export function proposeTitle(input) {
+  const ctx = readEvidence(input);
+  const ranked = rankCandidates(collectCandidates(ctx));
+  if (ranked.length === 0) return { title: null, reason: "no-signal" };
+  const best = dropVaguePrefix(ranked[0], ranked, ctx);
+  return { title: best.title, reason: "better" };
+}
+
+/**
+ * True when a title is still the program line Kagan started the thread with,
+ * or one word too vague to recall the thread by.
  * @param {string} title
  */
 export function isPlaceholder(title) {
-  const t = title.trim();
+  const t = String(title || "").trim();
   if (!t) return true;
   if (PLACEHOLDER.test(t)) return true;
+  if (PROGRAM.test(t)) return true;
   const words = formatTitle(t).split(/\s+/).filter(Boolean);
   if (words.length === 1 && VAGUE.has(words[0])) return true;
-  if (/^[a-z0-9]+(?:-[a-z0-9]+)?$/i.test(t) && t.length <= 16 && !/\s/.test(t)) {
-    return /agent|claude|codex|kimi|plugin|cursor/i.test(t);
-  }
-  return false;
-}
-
-/** @param {string} s */
-function fp(s) {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
+  return (
+    t.length <= 24 &&
+    /^[a-z0-9]+(?:-[a-z0-9]+)?$/i.test(t) &&
+    /agent|claude|codex|kimi|plugin|cursor/i.test(t)
+  );
 }

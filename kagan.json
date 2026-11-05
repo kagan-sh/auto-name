@@ -1,10 +1,10 @@
 {
   "id": "dev.kagan.auto-name",
   "name": "Auto Name",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "kagan": ">=0.1.0",
   "entry": "main.js",
-  "instructions": "Renames sidebar threads to short recallable word sets from changed paths, events, branch, and project. Deterministic, no model. Names you set yourself are left alone while Respect is on. Use Update thread names now to rescan.",
+  "instructions": "Names a thread once, from its prompt, changed paths, events, branch, and project. Deterministic, no model. Kagan keeps a title after the first name, so a thread with a title is left alone. Use Update thread names now to rescan.",
   "powers": {
     "areas": ["threads", "database"]
   },
@@ -14,14 +14,9 @@
       "title": "Rename threads automatically",
       "default": true
     },
-    "respectManual": {
-      "type": "boolean",
-      "title": "Do not change names I set myself",
-      "default": true
-    },
     "intervalSec": {
       "type": "select",
-      "title": "Wait at least this many seconds between name changes",
+      "title": "Wait at least this many seconds between checks",
       "options": ["15", "30", "45", "60", "120"],
       "default": "45"
     },

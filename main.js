@@ -4,38 +4,52 @@ import { v_flex } from "gpui-base";
 import { KgButton } from "gpui-component";
 import { log, settings, toast } from "kagan/host";
 import { next, reply, fail } from "kagan/jobs";
+import { get, list, rename, sidebar } from "kagan/threads";
+import { MAX_WORDS } from "./text.js";
+import { decideName, isFinalReason, isKeptTitleError } from "./policy.js";
 import {
-  get,
-  list,
-  rename,
-  metadata,
-  setMetadata,
-  sidebar,
-  changes,
-  events,
-  environment,
-  project,
-} from "kagan/threads";
-import { migrate, query, run as dbRun } from "kagan/database";
-import { proposeTitle, isPlaceholder, formatTitle, sameMeaning } from "./name.js";
+  ensureDb,
+  loadState,
+  readLastSweepAt,
+  recentNames,
+  recordSweep,
+  saveState,
+} from "./store.js";
+import { gatherSignal } from "./signal.js";
 
-/** @typedef {{ force: boolean, threadId?: string, toast?: boolean }} Work */
+/** A failure as one log line, with the stack when the error has one. */
+function describe(error) {
+  return error instanceof Error ? (error.stack ?? error.message) : String(error);
+}
+
+/**
+ * One queued piece of work: a sweep over every thread, or one thread by id.
+ * @typedef {{ kind: "sweep", force: boolean, toast?: boolean }
+ *   | { kind: "thread", threadId: string }} Work
+ */
 
 /** @type {Work[]} */
 const queue = [];
-/** @type {Promise<void> | null} */
-let ready = null;
-let waking = false;
-/** @type {{ at: number, renamed: number, skipped: number } | null} */
-let lastSweep = null;
+let draining = false;
+/** Names written and threads skipped by the last sweep in this session. */
+/** @type {{ renamed: number, skipped: number } | null} */
+let lastRun = null;
+
 
 export default class Plugin extends View {
   init(_props, cx) {
     cx.spawn(async () => {
       for (;;) {
-        const job = await next();
+        let job;
         try {
-          reply(job.id, await handle(job));
+          job = await next();
+        } catch (error) {
+          // The host closed the queue: this plugin is unloading.
+          log("info", `job loop stopped: ${describe(error)}`);
+          return;
+        }
+        try {
+          reply(job.id, await dispatchJob(job));
         } catch (error) {
           fail(job.id, String(error));
         }
@@ -43,11 +57,14 @@ export default class Plugin extends View {
     });
 
     cx.spawn(async (cx) => {
-      await ensureDb();
-      enqueue({ force: false });
       for (;;) {
+        try {
+          await ensureDb();
+          queue.push({ kind: "sweep", force: false });
+        } catch (error) {
+          log("error", `sweep timer: ${describe(error)}`);
+        }
         await cx.sleep(Math.max(5, cfg().intervalSec) * 1000);
-        if (cfg().enabled) enqueue({ force: false });
       }
     });
 
@@ -59,6 +76,10 @@ export default class Plugin extends View {
       }
     });
   }
+
+  render() {
+    return div();
+  }
 }
 
 export class StatusPanel extends View {
@@ -67,25 +88,21 @@ export class StatusPanel extends View {
     this.enabled = true;
     this.summary = "Starting…";
     this.timer = cx.timer.every(2000, async (cx) => {
-      await ensureDb();
-      this.rows = await query(
-        "SELECT auto_title, reason, renamed_at FROM names ORDER BY renamed_at DESC LIMIT 8",
-        [],
-      );
       this.enabled = cfg().enabled;
-      this.summary = lastSweep
-        ? `Last update: renamed ${lastSweep.renamed}, skipped ${lastSweep.skipped}`
-        : "No update yet — press the button";
+      try {
+        this.rows = await recentNames();
+        this.summary = await describeLastCheck();
+      } catch (error) {
+        this.summary = `Cannot read naming state: ${error}`;
+      }
       cx.notify();
     });
   }
 
   render() {
-    const lines = this.rows.map((row) => {
-      const title = String(row.auto_title || "");
-      const why = String(row.reason || "");
-      return why && why !== "better" ? `${title} · ${why}` : title;
-    });
+    const lines = this.rows.map((row) =>
+      row.reason && row.reason !== "better" ? `${row.title} · ${row.reason}` : row.title,
+    );
     const status = this.enabled ? "Renaming is on" : "Renaming is paused";
     return v_flex()
       .gap_1()
@@ -96,25 +113,34 @@ export class StatusPanel extends View {
           .primary()
           .compact()
           .on_click((_e, cx) => {
-            enqueue({ force: true, toast: true });
+            queue.push({ kind: "sweep", force: true, toast: true });
             this.summary = "Updating…";
             cx.notify();
           }),
         div().child(status),
         div().child(this.summary),
-        div().child(lines.length ? lines.join("\n") : "No renames yet"),
+        div().child("Kagan keeps a title after the first name, so each thread is named once."),
+        div().child(lines.length ? lines.join("\n") : "No names yet"),
       ]);
   }
 }
 
+async function describeLastCheck() {
+  const at = await readLastSweepAt();
+  const when = at ? `Last check: ${new Date(at).toLocaleString()}` : "No check yet — press the button";
+  if (!lastRun) return when;
+  return `${when} · renamed ${lastRun.renamed}, skipped ${lastRun.skipped}`;
+}
+
 /**
  * @param {import("kagan/jobs").Job} job
+ * @returns {Promise<null>}
  */
-async function handle(job) {
+async function dispatchJob(job) {
   await ensureDb();
 
   if (job.kind === "command" && job.command === "refresh") {
-    enqueue({ force: true, toast: true });
+    queue.push({ kind: "sweep", force: true, toast: true });
     log("info", "refresh queued");
     return null;
   }
@@ -125,58 +151,65 @@ async function handle(job) {
   }
 
   if (job.kind === "event") {
-    if (!cfg().enabled) return;
-    enqueue({ force: false, threadId: /** @type {string} */ (job.threadId) });
-    return;
+    const threadId = typeof job.threadId === "string" ? job.threadId : "";
+    if (threadId && cfg().enabled) queue.push({ kind: "thread", threadId });
+    return null;
   }
 
-  throw new Error(`Unknown job ${job.kind}: ${job.command ?? job.type ?? ""}`);
-}
-
-/** @param {Work} work */
-function enqueue(work) {
-  queue.push(work);
+  throw new Error(`Unknown ${job.kind} job${job.kind === "command" ? `: ${job.command}` : ""}`);
 }
 
 async function drain() {
-  if (waking || queue.length === 0) return;
-  waking = true;
+  if (draining || queue.length === 0) return;
+  draining = true;
   try {
     while (queue.length) {
       const batch = queue.splice(0, queue.length);
-      const force = batch.some((w) => w.force);
-      const toastAfter = batch.some((w) => w.toast);
-      /** @type {Set<string>} */
-      const focus = new Set();
-      for (const w of batch) if (w.threadId) focus.add(w.threadId);
-
-      let renamed = 0;
-      let skipped = 0;
-
-      if (focus.size && !force) {
-        for (const id of focus) {
-          if (await considerThread(id, { force: false })) renamed++;
-          else skipped++;
-        }
-        if (await dueForSweep()) {
-          const full = await sweepAll({ force: false });
-          renamed += full.renamed;
-          skipped += full.skipped;
-        }
-      } else {
-        const full = await sweepAll({ force });
-        renamed = full.renamed;
-        skipped = full.skipped;
+      try {
+        await runBatch(batch);
+      } catch (error) {
+        // One bad batch must not lose the rest of the queue.
+        log("error", `drain: ${describe(error)}`);
       }
-
-      lastSweep = { at: Date.now(), renamed, skipped };
-      if (toastAfter) await toast(`Renamed ${renamed}, skipped ${skipped}`);
     }
-  } catch (error) {
-    log("error", `drain: ${error}`);
   } finally {
-    waking = false;
+    draining = false;
   }
+}
+
+/**
+ * @param {Work[]} batch
+ */
+async function runBatch(batch) {
+  const forced = batch.some((w) => w.kind === "sweep" && w.force);
+  const toastAfter = batch.some((w) => w.kind === "sweep" && w.toast);
+  /** @type {Set<string>} */
+  const focus = new Set();
+  for (const w of batch) if (w.kind === "thread") focus.add(w.threadId);
+
+  /** @type {Set<string>} */
+  const named = new Set();
+  /** @type {Set<string>} */
+  const seen = new Set();
+
+  if (focus.size && !forced) {
+    for (const id of focus) {
+      seen.add(id);
+      if ((await considerThread(id, { deep: true })) === "named") named.add(id);
+    }
+    if (await dueForSweep()) {
+      const full = await sweepAll({ force: false, skip: seen });
+      for (const id of full.named) named.add(id);
+      for (const id of full.seen) seen.add(id);
+    }
+  } else {
+    const full = await sweepAll({ force: forced });
+    for (const id of full.named) named.add(id);
+    for (const id of full.seen) seen.add(id);
+  }
+
+  lastRun = { renamed: named.size, skipped: seen.size - named.size };
+  if (toastAfter) await toast(`Renamed ${named.size}, skipped ${seen.size - named.size}`);
 }
 
 function cfg() {
@@ -185,292 +218,128 @@ function cfg() {
   const maxWords = Number(s.maxWords);
   return {
     enabled: s.enabled !== false,
-    respectManual: s.respectManual !== false,
     intervalSec: Number.isFinite(interval) && interval > 0 ? interval : 45,
-    maxWords: Number.isFinite(maxWords) && maxWords >= 1 && maxWords <= 4 ? maxWords : 4,
+    maxWords:
+      Number.isFinite(maxWords) && maxWords >= 1 && maxWords <= MAX_WORDS
+        ? maxWords
+        : MAX_WORDS,
   };
 }
 
-async function ensureDb() {
-  if (!ready) {
-    ready = migrate([
-      `CREATE TABLE IF NOT EXISTS names (
-        thread_id TEXT PRIMARY KEY,
-        auto_title TEXT NOT NULL,
-        content_fp TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        renamed_at INTEGER NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )`,
-    ]).then(() => undefined);
-  }
-  await ready;
-}
-
 async function dueForSweep() {
-  const rows = await query("SELECT value FROM meta WHERE key = ?", ["last_sweep_at"]);
-  const last = Number(rows[0]?.value || 0);
-  return Date.now() - last >= cfg().intervalSec * 1000;
+  return Date.now() - (await readLastSweepAt()) >= cfg().intervalSec * 1000;
 }
 
 /**
- * @param {{ force?: boolean }} [opts]
+ * A thread the window lists: not hidden and not archived.
+ * @param {{ visibility?: string, archivedAt?: number | null }} thread
  */
-async function sweepAll(opts = {}) {
-  await dbRun(
-    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    ["last_sweep_at", String(Date.now())],
-  );
-  let renamed = 0;
-  let skipped = 0;
-  if (!cfg().enabled && !opts.force) return { renamed, skipped };
-
-  const threads = await visibleThreads();
-  for (const thread of threads) {
-    if (await considerThread(thread.id, opts)) renamed++;
-    else skipped++;
-  }
-  log("info", `sweep (${opts.force ? "force" : "soft"}): renamed ${renamed}, skipped ${skipped}`);
-  return { renamed, skipped };
+function isListed(thread) {
+  return thread.visibility !== "hidden" && !thread.archivedAt;
 }
 
+/**
+ * @param {{ force?: boolean, skip?: Set<string> }} [opts]
+ * @returns {Promise<{ named: string[], seen: string[] }>}
+ */
+async function sweepAll(opts = {}) {
+  await recordSweep();
+  /** @type {string[]} */
+  const named = [];
+  /** @type {string[]} */
+  const seen = [];
+  if (!cfg().enabled && !opts.force) return { named, seen };
+
+  for (const thread of await visibleThreads()) {
+    if (opts.skip?.has(thread.id)) continue;
+    seen.push(thread.id);
+    if ((await considerThread(thread.id, { deep: true, force: !!opts.force })) === "named") {
+      named.push(thread.id);
+    }
+  }
+  log("info", `sweep (${opts.force ? "force" : "soft"}): named ${named.length}, seen ${seen.length}`);
+  return { named, seen };
+}
+
+/**
+ * @returns {Promise<{ id: string, visibility?: string, archivedAt?: number | null }[]>}
+ */
 async function visibleThreads() {
   try {
-    const side = sidebar();
-    return (side.threads || []).filter((t) => t.visibility !== "hidden" && !t.archivedAt);
-  } catch {
-    const all = await list({ archived: false, limit: 80 });
-    return all.filter((t) => t.visibility !== "hidden");
+    return (sidebar().threads || []).filter(isListed);
+  } catch (error) {
+    log("debug", `sidebar: ${describe(error)}`);
+    return (await list({ archived: false, limit: 80 })).filter(isListed);
+  }
+}
+
+/** A failed row write is logged; it must not escape the batch. */
+/**
+ * @param {{ threadId: string, title: string,
+ *   reason: import("./policy.js").NameReason }} name
+ */
+async function remember(name) {
+  try {
+    await saveState({ ...name, settled: true });
+  } catch (error) {
+    log("warn", `save ${name.threadId}: ${describe(error)}`);
   }
 }
 
 /**
  * @param {string} threadId
- * @param {{ force?: boolean }} [opts]
+ * @param {{ deep?: boolean, force?: boolean }} [opts]
+ * @returns {Promise<"named" | "skipped" | "failed">}
  */
 async function considerThread(threadId, opts = {}) {
-  if (!threadId) return false;
+  if (!threadId) return "skipped";
   const c = cfg();
-  if (!c.enabled && !opts.force) return false;
+  if (!c.enabled && !opts.force) return "skipped";
+
+  const state = await loadState(threadId);
+  if (state?.settled) return "skipped";
 
   let thread;
   try {
     thread = await get(threadId);
   } catch (error) {
-    log("warn", `get ${threadId}: ${error}`);
-    return false;
+    log("warn", `get ${threadId}: ${describe(error)}`);
+    return "failed";
   }
-  if (thread.archivedAt || thread.visibility === "hidden") return false;
+  if (!isListed(thread)) return "skipped";
 
-  const state = await loadState(threadId);
-  const meta = /** @type {{ autoTitle?: string, hold?: boolean } | null} */ (
-    (await metadata(threadId).catch(() => null)) || null
-  );
-
-  if (
-    c.respectManual &&
-    state?.auto_title &&
-    thread.title !== state.auto_title &&
-    !isPlaceholder(thread.title)
-  ) {
-    if (!meta?.hold) {
-      await setMetadata(threadId, { ...(meta || {}), hold: true, autoTitle: state.auto_title });
-      log("info", `hold ${threadId}: manual title “${thread.title}”`);
-    }
-    // Refresh does not override a name the person set.
-    return false;
-  }
-  if (meta?.hold) return false;
-
-  const signal = await gatherSignal(thread, { deep: !!opts.force });
-  const screen = [signal.screen, thread.title].filter(Boolean).join("\n");
-  if (!screen && signal.paths.length === 0) return false;
-
-  const proposal = proposeTitle({
-    screen,
-    paths: signal.paths,
+  const signal = await gatherSignal(thread, { deep: !!opts.deep });
+  const decision = decideName({
     currentTitle: thread.title,
+    autoTitle: state?.title,
+    goal: signal.goal,
+    recent: signal.recent,
+    prompt: signal.prompt,
+    paths: signal.paths,
     maxWords: c.maxWords,
   });
 
-  if (!proposal.title) return false;
-  if (sameMeaning(thread.title, proposal.title)) {
-    await saveState(threadId, formatTitle(thread.title) || thread.title, proposal.fingerprint, "same-meaning");
-    return false;
-  }
-  if (state?.content_fp === proposal.fingerprint && state?.auto_title && sameMeaning(state.auto_title, proposal.title)) {
-    return false;
-  }
-  if (formatTitle(thread.title) === proposal.title) {
-    await saveState(threadId, proposal.title, proposal.fingerprint, "already");
-    return false;
-  }
-
-  if (!opts.force && state?.renamed_at && Date.now() - Number(state.renamed_at) < c.intervalSec * 1000) {
-    return false;
+  if (!decision.title) {
+    // Settle it so a finished thread is not re-scored on every sweep.
+    if (isFinalReason(decision.reason)) {
+      await remember({ threadId, title: thread.title, reason: decision.reason });
+    }
+    return "skipped";
   }
 
   try {
-    await rename(threadId, proposal.title);
+    await rename(threadId, decision.title);
   } catch (error) {
-    log("warn", `rename ${threadId} → “${proposal.title}”: ${error}`);
-    return false;
-  }
-
-  await saveState(threadId, proposal.title, proposal.fingerprint, proposal.reason);
-  await setMetadata(threadId, {
-    ...(meta || {}),
-    autoTitle: proposal.title,
-    hold: false,
-    fp: proposal.fingerprint,
-  });
-  log(
-    "info",
-    `named ${threadId}: “${thread.title}” → “${proposal.title}” (${proposal.reason}, ${proposal.score.toFixed(1)})`,
-  );
-  return true;
-}
-
-/**
- * @param {import("kagan/threads").Thread} thread
- * @param {{ deep?: boolean }} [opts]
- */
-async function gatherSignal(thread, opts = {}) {
-  /** @type {string[]} */
-  const paths = [];
-  /** @type {string[]} */
-  const goalLines = [];
-  /** @type {string[]} */
-  const recentLines = [];
-
-  // Soft sweeps: uncommitted only. Force: also branch (one extra host call).
-  const scopes = opts.deep
-    ? /** @type {const} */ (["uncommitted", "branch"])
-    : /** @type {const} */ (["uncommitted"]);
-  for (const scope of scopes) {
-    try {
-      const ch = await changes(thread.id, scope);
-      for (const f of ch.files || []) {
-        if (f.path) paths.push(f.path);
-        if (f.oldPath) paths.push(f.oldPath);
-      }
-    } catch {
-      // Not listed in this window.
+    if (isKeptTitleError(error)) {
+      await remember({ threadId, title: thread.title, reason: "kept" });
+    } else {
+      log("warn", `rename ${threadId} → “${decision.title}”: ${describe(error)}`);
+      return "failed";
     }
+    return "skipped";
   }
 
-  try {
-    // Newest first — cheap slice for latest state; tail of array becomes goal-ish leftovers.
-    const logEvents = await events(thread.id, { limit: opts.deep ? 48 : 24, order: "desc" });
-    const chronological = logEvents.slice().reverse();
-    for (const ev of chronological) {
-      const data = /** @type {Record<string, unknown>} */ (ev.data || {});
-      /** @type {string[]} */
-      const bits = [];
-      if (ev.type === "message" && typeof data.text === "string") bits.push(data.text);
-      if (ev.type === "notice" && typeof data.text === "string") bits.push(data.text);
-      if (ev.type === "answered" && typeof data.title === "string") bits.push(...summarizeAnswered(data.title));
-      if (ev.type === "file.changed" && typeof data.path === "string") {
-        paths.push(data.path);
-        bits.push(data.path);
-      }
-      if (ev.type === "file.predicted") {
-        if (typeof data.path === "string") paths.push(data.path);
-        if (typeof data.line === "string") bits.push(data.line);
-      }
-      if (ev.type === "tool" && typeof data.name === "string") bits.push(data.name);
-      if (!bits.length) continue;
-      if (goalLines.length < 10) goalLines.push(...bits);
-      else recentLines.push(...bits);
-    }
-  } catch (error) {
-    log("debug", `events ${thread.id}: ${error}`);
-  }
-
-  if (opts.deep) {
-    try {
-      if (thread.environmentId) {
-        const env = await environment(thread.environmentId);
-        if (env.branch && !/^(main|master|develop|trunk)$/i.test(env.branch)) {
-          recentLines.push(env.branch.replace(/[-_/]+/g, " "));
-        }
-        if (env.path) {
-          const base = env.path.split(/[/\\]/).filter(Boolean).pop();
-          if (base && !/^(personal|agent|agent-\d+|env_[a-f0-9]+)$/i.test(base)) {
-            recentLines.push(base.replace(/[-_]+/g, " "));
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    try {
-      const proj = await project(thread.projectId);
-      if (proj?.name && !/^(personal)$/i.test(proj.name)) goalLines.push(proj.name);
-    } catch {
-      // ignore
-    }
-  }
-
-  for (const p of paths.slice(0, 12)) goalLines.push(p);
-
-  return {
-    screen: [...goalLines, "", ...recentLines].join("\n"),
-    paths: [...new Set(paths)].slice(0, 40),
-  };
-}
-
-/**
- * @param {string} threadId
- */
-async function loadState(threadId) {
-  const rows = await query(
-    "SELECT thread_id, auto_title, content_fp, reason, renamed_at FROM names WHERE thread_id = ?",
-    [threadId],
-  );
-  return rows[0] || null;
-}
-
-/**
- * @param {string} threadId
- * @param {string} title
- * @param {string} fp
- * @param {string} reason
- */
-async function saveState(threadId, title, fp, reason) {
-  await dbRun(
-    `INSERT INTO names (thread_id, auto_title, content_fp, reason, renamed_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(thread_id) DO UPDATE SET
-       auto_title = excluded.auto_title,
-       content_fp = excluded.content_fp,
-       reason = excluded.reason,
-       renamed_at = excluded.renamed_at`,
-    [threadId, title, fp, reason, Date.now()],
-  );
-}
-
-/**
- * @param {string} title
- */
-function summarizeAnswered(title) {
-  const head = String(title || "").split("\n")[0] || "";
-  /** @type {string[]} */
-  const bits = [];
-  const install = head.match(/^Install\s+(.+?)(?:\s+\d|\s+\(|$)/i);
-  if (install) {
-    bits.push(install[1].replace(/\s+\d+(\.\d+)*$/, "").trim());
-    const id = head.match(/\((dev\.[^)]+)\)/);
-    if (id) bits.push(id[1].split(".").pop() || "");
-    return bits.filter(Boolean);
-  }
-  if (/caution:|clipboard|database|powers/i.test(title)) {
-    return head.length > 8 && head.length < 80 ? [head] : bits;
-  }
-  if (head.length >= 8 && head.length < 120) bits.push(head);
-  return bits;
+  await remember({ threadId, title: decision.title, reason: decision.reason });
+  log("info", `named ${threadId}: “${thread.title}” → “${decision.title}” (${decision.reason})`);
+  return "named";
 }
