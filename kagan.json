@@ -53,7 +53,6 @@
     "thread.waiting",
     "thread.idle",
     "thread.turn.ended",
-    "thread.file.changed",
     "thread.started",
     "thread.answered",
     "thread.notice"
